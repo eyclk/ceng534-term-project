@@ -71,7 +71,7 @@ def main(args):
         gold_dict = json_load(fh)
     with torch.no_grad(), \
             tqdm(total=len(dataset)) as progress_bar:
-        for cw_idxs, cc_idxs, qw_idxs, qc_idxs, y1, y2, ids in data_loader:
+        for cw_idxs, cc_idxs, qw_idxs, qc_idxs, y1, y2, ids in data_loader:   # !!!!!!!! cc_idxs ve qc_idxs değerlerini character level embeddingler için kullan.
             # Setup for forward
             cw_idxs = cw_idxs.to(device)
             qw_idxs = qw_idxs.to(device)

@@ -723,3 +723,65 @@ def compute_f1(a_gold, a_pred):
     recall = 1.0 * num_same / len(gold_toks)
     f1 = (2 * precision * recall) / (precision + recall)
     return f1
+
+
+def word_to_one_hot_vector(word_char_idxs, alphabet=string.ascii_lowercase + string.digits + ".,?!-\'_"):
+    # Fix the length of the word string as 15. If necessary, pad with '_'. 15 is from args.py
+    """if len(word_string) >= 15:
+        fixed_length_word_string = word_string[:15]
+    else:
+        fixed_length_word_string = word_string
+        for i in range(len(word_string), 15):
+            fixed_length_word_string += '_' """
+    vector = []
+    for letter_idx in word_char_idxs:
+        temp_char_emb = torch.zeros(401)  # 1192
+        if letter_idx != 0 and letter_idx <= 401:  # Our limit is 401 different char values.
+            temp_char_emb[letter_idx - 1] = 1
+        vector.append(torch.unsqueeze(temp_char_emb, dim=0))
+
+    """vector = [[0 if char != letter else 1 for char in alphabet]
+              for letter in word_char_idxs]"""
+    return torch.flatten(torch.cat(vector, dim=0))
+
+
+def get_one_hot_vectors(batch_of_x):
+    one_hot_vectors_of_all_words = []
+    for batch_unit in batch_of_x:
+        # print("batch_unit -->", batch_unit)
+        one_hot_vectors_for_a_word = []
+        for temp_word in batch_unit:
+            one_hot_vectors_for_a_word.append(torch.unsqueeze(word_to_one_hot_vector(temp_word), dim=0))
+        # print(one_hot_vectors_for_a_word[0].shape)
+        temp_one_hot = torch.cat(one_hot_vectors_for_a_word, dim=0)
+        one_hot_vectors_of_all_words.append(torch.unsqueeze(temp_one_hot, dim=0))
+    return torch.cat(one_hot_vectors_of_all_words, dim=0)
+
+
+"""def get_max(batch_of_x):
+    temp_max = 0
+    count = 0
+    for b in batch_of_x:
+        for i in b:
+            for j in i:
+                if j == 1192:  # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+                    count += 1
+            # t_max = torch.max(i)
+            # if t_max > temp_max:
+            #     temp_max = t_max
+    print(count)
+    exit(0)"""
+
+
+"""def get_char_embedding(x):
+    one_hot_vectors_of_all_words = get_one_hot_vectors(x)
+    # print(one_hot_vectors_of_all_words.shape)
+
+    conv_layer = torch.nn.Conv1d(in_channels=one_hot_vectors_of_all_words.shape[1],
+                                 out_channels=one_hot_vectors_of_all_words.shape[1], kernel_size=5)
+    temp_vector = one_hot_vectors_of_all_words
+    # print("-> ", temp_vector.shape)
+    temp_vector = conv_layer(temp_vector)
+    # print("---> ", temp_vector.shape)
+    pool_layer = torch.nn.MaxPool1d(kernel_size=10)
+    temp_vector = pool_layer(temp_vector)"""

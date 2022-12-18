@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from util import masked_softmax
+from util import masked_softmax, get_one_hot_vectors
 
 
 class Embedding(nn.Module):
@@ -27,11 +27,28 @@ class Embedding(nn.Module):
         super(Embedding, self).__init__()
         self.drop_prob = drop_prob
         self.embed = nn.Embedding.from_pretrained(word_vectors)
-        self.proj = nn.Linear(word_vectors.size(1), hidden_size, bias=False)
+        self.proj = nn.Linear(word_vectors.size(1) + 64, hidden_size, bias=False)
         self.hwy = HighwayEncoder(2, hidden_size)
 
-    def forward(self, x):
-        emb = self.embed(x)   # (batch_size, seq_len, embed_size)
+        self.word_vectors = word_vectors
+        # self.cnn = nn.Conv1d(in_channels=399, out_channels=399, kernel_size=33)  # 3 in here is placeholder. it should dynamically chage for the number of words in a batch.
+        self.max_pool = nn.MaxPool1d(kernel_size=99)  # The kernel sizes make sure the char embedding size becomes 64, but it might be wrong.
+
+    def forward(self, x, x_char):
+        # get_max(x_char)
+        emb = self.embed(x)   # (batch_size, seq_len, w_embed_size)
+
+        print("x_char ----> ", len(x_char), "*****", len(x_char[0]), "*****", len(x_char[0][0]))
+        # For char embeddings
+        print("word vectors --> ", self.word_vectors)
+        cnn = nn.Conv1d(in_channels=len(x_char[0]), out_channels=len(x_char[0]), kernel_size=33)
+
+        one_hot_vectors = get_one_hot_vectors(x_char)  # (batch_size, seq_len, num_of_letters_in_a_word(16)*alphabet_length(401))
+        temp_vector = cnn(one_hot_vectors)
+        temp_char_emb = self.max_pool(temp_vector)  # (batch_size, seq_len, 64)
+
+        emb = torch.cat([emb, temp_char_emb], dim=2)  # (batch_size, seq_len, w_embed_size + 64)
+
         emb = F.dropout(emb, self.drop_prob, self.training)
         emb = self.proj(emb)  # (batch_size, seq_len, hidden_size)
         emb = self.hwy(emb)   # (batch_size, seq_len, hidden_size)

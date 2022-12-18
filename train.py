@@ -23,6 +23,8 @@ from tqdm import tqdm
 from ujson import load as json_load
 from util import collate_fn, SQuAD
 
+# import chars2vec    ********************
+
 
 def main(args):
     # Set up logging and devices
@@ -40,9 +42,12 @@ def main(args):
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    # Get embeddings
+    # Get word embeddings
     log.info('Loading embeddings...')
     word_vectors = util.torch_from_json(args.word_emb_file)
+
+    # Get char embeddings                          ***********************************
+    # c2v_model = chars2vec.load_model('eng_50')
 
     # Get model
     log.info('Building model...')
@@ -95,15 +100,20 @@ def main(args):
         log.info(f'Starting epoch {epoch}...')
         with torch.enable_grad(), \
                 tqdm(total=len(train_loader.dataset)) as progress_bar:
-            for cw_idxs, cc_idxs, qw_idxs, qc_idxs, y1, y2, ids in train_loader:
+            for cw_idxs, cc_idxs, qw_idxs, qc_idxs, y1, y2, ids in train_loader:  # !!!!!!!!!! cc_idxs ve qc_idxs değerlerini character level embeddingler için kullan.
                 # Setup for forward
+                print("cc_idxs --> ", cc_idxs)
+                print("cc_idxs[0] --> ", cc_idxs[0])
+
                 cw_idxs = cw_idxs.to(device)
                 qw_idxs = qw_idxs.to(device)
+                cc_idxs = cc_idxs.to(device)
+                qc_idxs = qc_idxs.to(device)
                 batch_size = cw_idxs.size(0)
                 optimizer.zero_grad()
 
                 # Forward
-                log_p1, log_p2 = model(cw_idxs, qw_idxs)
+                log_p1, log_p2 = model(cw_idxs, qw_idxs, cc_idxs, qc_idxs)
                 y1, y2 = y1.to(device), y2.to(device)
                 loss = F.nll_loss(log_p1, y1) + F.nll_loss(log_p2, y2)
                 loss_val = loss.item()
