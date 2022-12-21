@@ -27,11 +27,25 @@ class Embedding(nn.Module):
         super(Embedding, self).__init__()
         self.drop_prob = drop_prob
         self.embed = nn.Embedding.from_pretrained(word_vectors)
-        self.proj = nn.Linear(word_vectors.size(1), hidden_size, bias=False)
+        self.proj = nn.Linear(word_vectors.size(1)+64, hidden_size, bias=False)
         self.hwy = HighwayEncoder(2, hidden_size)
 
-    def forward(self, x):
-        emb = self.embed(x)   # (batch_size, seq_len, embed_size)
+        self.cnn = nn.Conv1d(in_channels=1, out_channels=8, kernel_size=(3, 3), padding=1)
+        self.max_pool = nn.MaxPool1d(kernel_size=2)  # 128/2=64 --> desired size for the char embeddings
+
+    def forward(self, x, x_char):
+        x_char_unsqueeze = torch.unsqueeze(x_char, dim=1)  # (batch_size, 1, seq_len, 16)
+        # print("\nx_char_unsqueeze.shape -->", x_char_unsqueeze.shape)
+        x_cnn = self.cnn(x_char_unsqueeze.float())  # (batch_size, 8, seq_len, 16)
+        # print("\nx_cnn.shape -->", x_cnn.shape)
+        x_permute_and_flatten = torch.flatten(torch.permute(x_cnn, (0, 2, 1, 3)), start_dim=2)  # (batch_size, seq_len, 128)
+        # print("\nx_permute_and_flatten.shape -->", x_permute_and_flatten.shape)
+        x_char_max_pool = self.max_pool(x_permute_and_flatten)  # (batch_size, seq_len, 64)
+        # print("\nx_char_max_pool.shape -->", x_char_max_pool.shape)
+
+        emb = self.embed(x)   # (batch_size, seq_len, w_embed_size)
+        emb = torch.cat([emb, x_char_max_pool], dim=2)  # (batch_size, seq_len, w_embed_size + 64)
+
         emb = F.dropout(emb, self.drop_prob, self.training)
         emb = self.proj(emb)  # (batch_size, seq_len, hidden_size)
         emb = self.hwy(emb)   # (batch_size, seq_len, hidden_size)
