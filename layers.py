@@ -27,11 +27,34 @@ class Embedding(nn.Module):
         super(Embedding, self).__init__()
         self.drop_prob = drop_prob
         self.embed = nn.Embedding.from_pretrained(word_vectors)
-        self.proj = nn.Linear(word_vectors.size(1), hidden_size, bias=False)
+        self.proj = nn.Linear(word_vectors.size(1)+64, hidden_size, bias=False)
         self.hwy = HighwayEncoder(2, hidden_size)
 
-    def forward(self, x):
-        emb = self.embed(x)   # (batch_size, seq_len, embed_size)
+        self.cnn = nn.Conv1d(in_channels=1, out_channels=8, kernel_size=(3, 3), padding=1)
+        self.max_pool = nn.MaxPool1d(kernel_size=2)  # 128/2=64 --> desired size for the char embeddings
+
+        self.proj_for_kw = nn.Linear(word_vectors.size(1), hidden_size, bias=False)
+
+    def forward(self, x, x_char, kw=None):
+        if kw is not None:
+            emb = self.embed(kw)
+            emb = F.dropout(emb, self.drop_prob, self.training)
+            emb = self.proj_for_kw(emb)  # (batch_size, seq_len, hidden_size)
+            emb = self.hwy(emb)  # (batch_size, seq_len, hidden_size)
+            return emb
+
+        x_char_unsqueeze = torch.unsqueeze(x_char, dim=1)  # (batch_size, 1, seq_len, 16)
+        # print("\nx_char_unsqueeze.shape -->", x_char_unsqueeze.shape)
+        x_cnn = self.cnn(x_char_unsqueeze.float())  # (batch_size, 8, seq_len, 16)
+        # print("\nx_cnn.shape -->", x_cnn.shape)
+        x_permute_and_flatten = torch.flatten(x_cnn.permute((0, 2, 1, 3)), start_dim=2)  # (batch_size, seq_len, 128)
+        # print("\nx_permute_and_flatten.shape -->", x_permute_and_flatten.shape)
+        x_char_max_pool = self.max_pool(x_permute_and_flatten)  # (batch_size, seq_len, 64)
+        # print("\nx_char_max_pool.shape -->", x_char_max_pool.shape)
+
+        emb = self.embed(x)   # (batch_size, seq_len, w_embed_size)
+        emb = torch.cat([emb, x_char_max_pool], dim=2)  # (batch_size, seq_len, w_embed_size + 64)
+
         emb = F.dropout(emb, self.drop_prob, self.training)
         emb = self.proj(emb)  # (batch_size, seq_len, hidden_size)
         emb = self.hwy(emb)   # (batch_size, seq_len, hidden_size)
@@ -140,7 +163,7 @@ class BiDAFAttention(nn.Module):
             nn.init.xavier_uniform_(weight)
         self.bias = nn.Parameter(torch.zeros(1))
 
-    def forward(self, c, q, c_mask, q_mask):
+    def forward(self, c, q, c_mask, q_mask, kw, kw_mask):
         batch_size, c_len, _ = c.size()
         q_len = q.size(1)
         s = self.get_similarity_matrix(c, q)        # (batch_size, c_len, q_len)
@@ -149,12 +172,35 @@ class BiDAFAttention(nn.Module):
         s1 = masked_softmax(s, q_mask, dim=2)       # (batch_size, c_len, q_len)
         s2 = masked_softmax(s, c_mask, dim=1)       # (batch_size, c_len, q_len)
 
+        # *******************  Our addition !!! Alternative Attention Method
+        """kw_len = kw.size(1)
+        similarity_kw_c = self.get_similarity_matrix(c, kw)  # (batch_size, c_len, kw_len)
+        kw_mask = kw_mask.view(batch_size, 1, kw_len)  # (batch_size, 1, kw_len)
+        s_kw_1 = masked_softmax(similarity_kw_c, kw_mask, dim=2)  # (batch_size, c_len, kw_len)
+        s_kw_2 = masked_softmax(similarity_kw_c, c_mask, dim=1)  # (batch_size, c_len, kw_len)
+        k1 = torch.bmm(s_kw_1, s_kw_2.transpose(1, 2))  # (batch_size, c_len, c_len)
+        k3 = torch.bmm(k1, c)  # (bs, c_len, c_len) x (bs, c_len, hid_size) => (bs, c_len, hid_size)"""
+        # *******************  Our addition !!! Basic Attention Method
+        kw_len = kw.size(1)
+        similarity_kw_c = self.get_similarity_matrix(c, kw)  # (batch_size, c_len, kw_len)
+        kw_mask = kw_mask.view(batch_size, 1, kw_len)  # (batch_size, 1, kw_len)
+        s_kw_c = masked_softmax(similarity_kw_c, kw_mask, dim=2)  # (batch_size, c_len, kw_len)
+
+        similarity_kw_q = self.get_similarity_matrix(q, kw)  # (batch_size, q_len, kw_len)
+        s_kw_q = masked_softmax(similarity_kw_q, kw_mask, dim=2)  # (batch_size, q_len, kw_len)
+
+        k1 = torch.bmm(s_kw_c, s_kw_q.transpose(1, 2))  # (batch_size, c_len, q_len)
+        k2 = torch.bmm(k1, s2.transpose(1, 2))  # (batch_size, c_len, c_len)
+        k3 = torch.bmm(k2, c)  # (bs, c_len, c_len) x (bs, c_len, hid_size) => (bs, c_len, hid_size)
+        # ********************
+
         # (bs, c_len, q_len) x (bs, q_len, hid_size) => (bs, c_len, hid_size)
         a = torch.bmm(s1, q)
         # (bs, c_len, c_len) x (bs, c_len, hid_size) => (bs, c_len, hid_size)
         b = torch.bmm(torch.bmm(s1, s2.transpose(1, 2)), c)
 
-        x = torch.cat([c, a, c * a, c * b], dim=2)  # (bs, c_len, 4 * hid_size)
+        x = torch.cat([c, a, c * a, c * b, c*k3], dim=2)  # (bs, c_len, 4 * hid_size)
+        # c*k3 is our addition!!!
 
         return x
 
@@ -198,7 +244,7 @@ class BiDAFOutput(nn.Module):
     """
     def __init__(self, hidden_size, drop_prob):
         super(BiDAFOutput, self).__init__()
-        self.att_linear_1 = nn.Linear(8 * hidden_size, 1)
+        self.att_linear_1 = nn.Linear(10 * hidden_size, 1)  # **************** 10 instead of 8
         self.mod_linear_1 = nn.Linear(2 * hidden_size, 1)
 
         self.rnn = RNNEncoder(input_size=2 * hidden_size,
@@ -206,7 +252,7 @@ class BiDAFOutput(nn.Module):
                               num_layers=1,
                               drop_prob=drop_prob)
 
-        self.att_linear_2 = nn.Linear(8 * hidden_size, 1)
+        self.att_linear_2 = nn.Linear(10 * hidden_size, 1)  # **************** 10 instead of 8
         self.mod_linear_2 = nn.Linear(2 * hidden_size, 1)
 
     def forward(self, att, mod, mask):
