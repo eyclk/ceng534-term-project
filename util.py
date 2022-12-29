@@ -15,6 +15,7 @@ import torch.utils.data as data
 import tqdm
 import numpy as np
 import ujson as json
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from collections import Counter
 
@@ -41,7 +42,7 @@ class SQuAD(data.Dataset):
         data_path (str): Path to .npz file containing pre-processed dataset.
         use_v2 (bool): Whether to use SQuAD 2.0 questions. Otherwise only use SQuAD 1.1.
     """
-    def __init__(self, data_path, use_v2=True):
+    def __init__(self, data_path, use_v2=True, purpose="train", top_k_keywords=3):
         super(SQuAD, self).__init__()
 
         dataset = np.load(data_path)
@@ -51,6 +52,37 @@ class SQuAD(data.Dataset):
         self.question_char_idxs = torch.from_numpy(dataset['ques_char_idxs']).long()
         self.y1s = torch.from_numpy(dataset['y1s']).long()
         self.y2s = torch.from_numpy(dataset['y2s']).long()
+
+        if os.path.exists(purpose + "_top_" + str(top_k_keywords) + "_keyword_idxs.txt"):
+            print("\n==> Loading '" + purpose + "_top_" + str(top_k_keywords) + "_keyword_idxs' from txt file...")
+            with open(purpose + "_top_" + str(top_k_keywords) + "_keyword_idxs.txt", "r") as temp_file_path:
+                lines_from_file = temp_file_path.readlines()
+                kw_idxs = []
+                for i in range(len(lines_from_file)):
+                    temp_line = lines_from_file[i].split(' ')
+                    temp_line_int = []
+                    for j in temp_line[:-1]:
+                        temp_line_int.append(int(j))
+                    kw_idxs.append(temp_line_int)
+                kw_idxs = np.array(kw_idxs)
+                self.keyword_idxs = torch.from_numpy(kw_idxs)
+                print("--> self.keyword_idxs.shape -> ", self.keyword_idxs.shape)
+                print("--> self.keyword_idxs -> ", self.keyword_idxs)
+        else:
+            query_strings = get_query_string_from_indices(self.question_idxs, purpose)
+            keywords = get_keywords_from_tfidf(query_strings, top_k_keywords)
+            self.keyword_idxs = get_keyword_idxs_from_keyword_strings(keywords, purpose, top_k_keywords)
+
+        # ********************************************
+        # ***** Burada elimizdeki string matrixindeki her bir satırındaki keywordleri bulup sadece onlar kalacak şekilde
+        # ayarla. Gerekirse padding ile her satırı doldur.
+        # Keywordleri dictionaryi kullanıp index hallerine geri dönüştür. Adı 'keyword_idxs' olabilir.
+        # Bu keyword_idxs'i __getitem__ ile train ve test'e gönder.
+        # Sonra da sırasıyla models ve layers.py içine bunu gönder. Layers'ın embed layerına bunu uyarla.
+
+        # **** Eğer bu iş çok uzun sürüyorsa keywordlerin indexlerine kadar bulup bir dosyaya kaydet (json gibi).
+        # Bunu ayrı bir .py dosyasında da yapabilirsin.
+        # Sonra da fonksiyonun içindeyken o dosyayı okuyup indexleri direkt kalan yerlere gönderip kullan.
 
         if use_v2:
             # SQuAD 2.0: Use index 0 for no-answer token (token 1 = OOV)
@@ -79,7 +111,8 @@ class SQuAD(data.Dataset):
                    self.question_char_idxs[idx],
                    self.y1s[idx],
                    self.y2s[idx],
-                   self.ids[idx])
+                   self.ids[idx],
+                   self.keyword_idxs[idx])
 
         return example
 
@@ -87,6 +120,7 @@ class SQuAD(data.Dataset):
         return len(self.valid_idxs)
 
 
+# ******* keyword_idxs is added here as well.
 def collate_fn(examples):
     """Create batch tensors from a list of individual examples returned
     by `SQuAD.__getitem__`. Merge examples of different length by padding
@@ -127,7 +161,7 @@ def collate_fn(examples):
     # Group by tensor type
     context_idxs, context_char_idxs, \
         question_idxs, question_char_idxs, \
-        y1s, y2s, ids = zip(*examples)
+        y1s, y2s, ids, keyword_idxs = zip(*examples)
 
     # Merge into batch tensors
     context_idxs = merge_1d(context_idxs)
@@ -137,10 +171,11 @@ def collate_fn(examples):
     y1s = merge_0d(y1s)
     y2s = merge_0d(y2s)
     ids = merge_0d(ids)
+    keyword_idxs = merge_1d(keyword_idxs)
 
     return (context_idxs, context_char_idxs,
             question_idxs, question_char_idxs,
-            y1s, y2s, ids)
+            y1s, y2s, ids, keyword_idxs)
 
 
 class AverageMeter:
@@ -723,3 +758,125 @@ def compute_f1(a_gold, a_pred):
     recall = 1.0 * num_same / len(gold_toks)
     f1 = (2 * precision * recall) / (precision + recall)
     return f1
+
+
+def get_query_string_from_indices(question_idxs, purpose):
+    if os.path.exists(purpose+"_query_strings.txt"):
+        print("\n==> Loading '" + purpose + "_query_strings' from txt file...")
+        with open(purpose+"_query_strings.txt", "r", encoding="utf-8") as temp_file_path:
+            lines_from_file = temp_file_path.readlines()
+            query_strings = []
+            for i in range(len(lines_from_file)):
+                temp_line = lines_from_file[i].split(' ')
+                query_strings.append(temp_line[:-1])
+            query_strings = np.array(query_strings)
+            print(purpose + "_query_strings.shape --> ", query_strings.shape)
+            print(purpose + "_query_strings --> ", query_strings)
+            return query_strings
+
+    query_strings = np.zeros((question_idxs.shape[0], question_idxs.shape[1]), dtype=object)
+    with open("data/word2idx.json", 'r') as word2idx_file:
+        word2idx_dict = json.load(word2idx_file)
+        for i in range(len(question_idxs)):
+            if i % 1000 == 0:
+                print(i, " out of all dataset for", purpose)
+            for j in range(len(question_idxs[i])):
+                if question_idxs[i][j] > 1:
+                    # Values for the keys start from 2. So, '-2' is necessary.
+                    query_strings[i][j] = list(word2idx_dict.keys())[question_idxs[i][j] - 2]
+                elif question_idxs[i][j] == 0:
+                    query_strings[i][j] = "--NULL--"
+                elif question_idxs[i][j] == 1:
+                    query_strings[i][j] = "--OOV--"
+
+    print("--> "+purpose+"_query_strings.shape -> ", query_strings.shape)
+    print("--> "+purpose+"_query_strings -> ", query_strings)
+    print("\n==> Saving '" + purpose + "_query_strings' into txt file...")
+    with open(purpose+"_query_strings.txt", "w", encoding="utf-8") as temp_file_path:
+        for i in query_strings:
+            for j in i:
+                """if j[:2] == '\\u':
+                    j = j[1:]"""
+                temp_file_path.write(j + ' ')
+            temp_file_path.write('\n')
+    return query_strings
+
+
+"""def get_keywords_from_dep_parser(query_strings):
+    dep_parser = spacy.load('en_core_web_sm')
+    for i in query_strings:
+        temp_sentence_w_list = np.delete(i, np.where(i == '--NULL--')[0])
+        temp_sentence = ' '.join(temp_sentence_w_list)  # get a sentence from each row of query_strings.
+
+        doc_dependencies = dep_parser(temp_sentence)
+        noun_chunk_list = []
+        for noun_chunk in doc_dependencies.noun_chunks:
+            noun_chunk_list.append(noun_chunk.text)
+            print(noun_chunk.text)
+        for n in noun_chunk_list:  # split each word in noun chunk list and make them into a 1d list."""
+
+
+def get_keywords_from_tfidf(query_strings, top_k_keywords):
+    query_sentences = []
+    for i in query_strings:
+        temp_sentence_w_list = np.delete(i, np.where(i == '--NULL--')[0])
+        temp_sentence = ' '.join(temp_sentence_w_list)  # get a sentence from each row of query_strings.
+        query_sentences.append(temp_sentence)
+    query_sentences = np.array(query_sentences)
+
+    temp_keywords = []
+    # In here, you can change 1000 into a different value for tfidf group batch size to try to find better keywords.
+    batch_group_size = 1000
+    for _ in range(len(query_sentences) // batch_group_size + 1):
+        if len(query_sentences) < batch_group_size:
+            batch_of_query_sentences = query_sentences
+        else:
+            batch_of_query_sentences = query_sentences[:batch_group_size]
+            query_sentences = query_sentences[batch_group_size:]
+        tfidf = TfidfVectorizer(lowercase=False, token_pattern=r"(?u)\S\S+")
+        result = tfidf.fit_transform(batch_of_query_sentences)
+        tfidf_matrix = result.toarray()
+
+        tfidf_vocab = tfidf.vocabulary_
+        unique_word_list = np.zeros(len(tfidf_vocab.keys()), dtype=object)
+        for t in tfidf_vocab.keys():
+            unique_word_list[tfidf_vocab[t]] = t
+
+        for row in tfidf_matrix:
+            temp_top_k_scores_and_words = sorted(zip(row, unique_word_list), reverse=True)[:top_k_keywords]
+
+            row_keywords = []
+            for top_k in temp_top_k_scores_and_words:
+                row_keywords.append(top_k[1])
+            temp_keywords.append(row_keywords)
+
+    keywords = np.array(temp_keywords)
+    print("--> keywords -> ", keywords)
+    print("--> keywords.shape -> ", keywords.shape)
+    return keywords
+
+
+def get_keyword_idxs_from_keyword_strings(keyword_strings, purpose, top_k_keywords):
+    word2idx_file = open("data/word2idx.json", 'r')
+    word2idx_dict = json.load(word2idx_file)
+    word2idx_file.close()
+
+    keyword_index_list = []
+    for i in keyword_strings:
+        temp_index_list = []
+        for j in i:
+            temp_index_list.append(word2idx_dict[j])
+        keyword_index_list.append(temp_index_list)
+    keyword_index_list = np.array(keyword_index_list)
+    keyword_index_list = torch.from_numpy(keyword_index_list)
+    print("--> keyword_index_list.shape -> ", keyword_index_list.shape)
+    print("--> keyword_index_list -> ", keyword_index_list)
+
+    print("\n==> Saving '" + purpose + "_top_" + str(top_k_keywords) + "_keyword_idxs' into txt file...")
+    with open(purpose + "_top_" + str(top_k_keywords) + "_keyword_idxs.txt", "w", encoding="utf-8") as temp_file_path:
+        for i in keyword_index_list:
+            for j in i:
+                temp_file_path.write(str(j.item()) + ' ')
+            temp_file_path.write('\n')
+
+    return keyword_index_list
